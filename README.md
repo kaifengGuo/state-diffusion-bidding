@@ -26,8 +26,13 @@ This repository intentionally contains only model, training, evaluation, and tes
 - **Dynamic Transformer RM:** scores variable-length state chunks and supports ensemble ranking.
 - **Single-step IDM:** maps the current state plus the selected state chunk to one executable bid.
 - **Best-of-N inference:** ranks multiple state-chunk candidates, executes one bid, and replans at the next tick.
+- **Optional DDPO-IS:** post-trains every stochastic reverse-diffusion transition with
+  Transformer-RM reward, a clipped importance-sampling objective, adaptive NTP
+  anchoring, and reference-denoiser regularization.
 
-The released evaluated path does not use DDPO. Experimental Episode-Q support is optional and is not included in this minimal repository.
+DDPO and Best-of-N are independent. DDPO changes the policy parameters during
+post-training; Best-of-N ranks samples at inference. The released DDPO experiment
+uses one sample at inference (`N=1`).
 
 ## Final AuctionNet Result
 
@@ -59,6 +64,7 @@ action scale = 1
 src/train_state_diffusion.py              state-chunk diffusion training
 src/train_single_step_idm.py              single-bid inverse dynamics training
 src/train_transformer_state_chunk_rm.py   dynamic Transformer RM training
+src/train_transformer_state_ddpo.py       DDPO-IS policy post-training
 src/evaluate_state_chunk_best_of_n.py     receding-horizon Best-of-N evaluation
 src/evaluate_auctionnet_offline.py         deterministic AuctionNet replay
 baselines/evaluate_cbd.py                  adapter for an external CBD checkout
@@ -138,6 +144,34 @@ python src/train_transformer_state_chunk_rm.py \
   --ensemble-size 5
 ```
 
+Post-train State Diffusion with DDPO-IS while keeping the RM and IDM frozen:
+
+```bash
+python src/train_transformer_state_ddpo.py \
+  --csv-path "$DATA_CSV" \
+  --state-checkpoint-dir outputs/state_h3_k5 \
+  --state-rm-checkpoint-dir outputs/transformer_rm \
+  --ensemble-members 0 4 \
+  --output-dir outputs/state_h3_k5_ddpo \
+  --rl-periods 24 \
+  --ntp-periods 24 \
+  --validation-periods 25 \
+  --iterations 5 \
+  --contexts-per-iteration 128 \
+  --group-size 8 \
+  --ppo-epochs 2 \
+  --learning-rate 1e-6 \
+  --ppo-clip 0.05 \
+  --reference-weight 0.1 \
+  --ntp-base-weight 0.5
+```
+
+Each context produces a group of on-policy denoising trajectories during
+training. All trajectories contribute group-normalized advantages and PPO
+updates; the group is not a Best-of-N selector. The scalar RM reward of the
+completed state chunk is broadcast to its stochastic denoising transitions,
+following the terminal-reward treatment used by DDPO-IS.
+
 ## Evaluate
 
 ```bash
@@ -158,6 +192,29 @@ python src/evaluate_state_chunk_best_of_n.py \
 ```
 
 Only the first bid decoded from the selected state chunk is executed. The policy replans after observing the next state.
+
+To evaluate the DDPO policy without Best-of-N, point
+`--state-checkpoint-dir` at the DDPO output and set both candidate arguments to
+one:
+
+```bash
+python src/evaluate_state_chunk_best_of_n.py \
+  --auctionnet-root /path/to/AuctionNet \
+  --state-checkpoint-dir outputs/state_h3_k5_ddpo \
+  --idm-checkpoint-dir outputs/idm_h3 \
+  --state-rm-checkpoint-dir outputs/transformer_rm \
+  --periods 26 27 \
+  --candidate-counts 1 \
+  --candidate-pool-size 1 \
+  --ensemble-members 0 4 \
+  --output-dir results/ddpo_n1
+```
+
+The locked Period 26-27 `N=1` comparison was `324.27` before DDPO and
+`327.77` after DDPO. The paired bootstrap delta is `+3.50`, with 95% CI
+`[-0.01, +7.22]`; this is a promising but borderline result. See
+[`docs/DDPO_RESULTS.md`](docs/DDPO_RESULTS.md) for the full protocol and risk
+metrics.
 
 ## Optional CBD Adapter
 
