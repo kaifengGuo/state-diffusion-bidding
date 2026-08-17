@@ -33,6 +33,9 @@ This repository intentionally contains only model, training, evaluation, and tes
   first IDM bid and replanning with the current policy to the end of the
   AuctionNet episode. Counterfactual candidates share continuation diffusion
   noise to reduce label variance.
+- **Transformer Episode-Q ablation:** tokenizes historical and candidate future
+  states, conditions on policy version and auction context, and can replace the
+  residual MLP scorer in policy-aligned DDPO.
 
 DDPO and Best-of-N are independent. DDPO changes the policy parameters during
 post-training; Best-of-N ranks samples at inference. The released DDPO experiment
@@ -70,6 +73,7 @@ src/train_single_step_idm.py              single-bid inverse dynamics training
 src/train_transformer_state_chunk_rm.py   dynamic Transformer RM training
 src/train_transformer_state_ddpo.py       DDPO-IS policy post-training
 src/train_policy_aligned_state_chunk_rm.py closed-loop Episode-Q collection/training
+src/train_policy_aligned_transformer_episode_q.py sequence Episode-Q ensemble training
 src/train_policy_aligned_state_ddpo.py     conservative Episode-Q DDPO
 src/build_policy_snapshot_mixture.py       mix current/base policy RM datasets
 src/evaluate_state_chunk_best_of_n.py     receding-horizon Best-of-N evaluation
@@ -244,7 +248,30 @@ python src/train_policy_aligned_state_chunk_rm.py \
 ```
 
 The collector writes one `policy_aligned_state_chunk_period_*.npz` file per
-period. Use those counterfactual contexts for one conservative DDPO update:
+period.
+
+The same collected files can train the optional sequence-aware Episode-Q
+ensemble. It supports padded runtime token lengths and selects checkpoints by
+candidate-ranking accuracy:
+
+```bash
+python src/train_policy_aligned_transformer_episode_q.py \
+  --state-checkpoint-dir outputs/state_h3_k5 \
+  --dataset-files outputs/episode_q/policy_aligned_state_chunk_period_*.npz \
+  --output-dir outputs/transformer_episode_q \
+  --train-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --val-periods 25 \
+  --test-periods 26 27 \
+  --ensemble-size 5 \
+  --learning-rate 3e-4 \
+  --rank-weight 1 \
+  --selection-metric score_pairwise
+```
+
+Point `--state-rm-checkpoint-dir` at either the residual MLP or Transformer
+Episode-Q directory; the DDPO scorer detects the model contract automatically.
+
+Use those counterfactual contexts for one conservative DDPO update:
 
 ```bash
 python src/train_policy_aligned_state_ddpo.py \

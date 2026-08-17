@@ -113,3 +113,41 @@ Round 2 raises aggregate CPA by 0.038 versus Base. Mean continuous CPA
 violation increases by 0.35 percentage points, with a cluster-bootstrap
 interval of `[0.00, 1.04]` percentage points; this safety tradeoff should be
 reported with the score gain.
+
+## Transformer Episode-Q Ablation
+
+The sequence-aware Episode-Q model tokenizes four historical states and the
+three-state candidate chunk, adds history/future type and positional
+embeddings, and combines attention pooling with action/reward, auction
+condition, and policy-version auxiliary features.
+
+The selected configuration uses `hidden=256`, four layers, `lr=3e-4`,
+`rank_weight=1`, and selects each ensemble member by validation Score pairwise
+accuracy.
+
+| Split / metric | MLP Episode-Q | Transformer Episode-Q |
+|---|---:|---:|
+| Period 25 pairwise accuracy | 69.79% | **75.22%** |
+| Period 25 top-1 regret | 0.95 | **0.75** |
+| Period 26-27 pairwise accuracy | 64.61% | **65.06%** |
+| Period 26-27 top-1 regret | 1.99 | **1.98** |
+| Period 26-27 Score MAE | **85.61** | 191.77 |
+| Period 26-27 Score R2 | **0.656** | -2.961 |
+
+The Transformer is a slightly better ranker but a worse absolute Score
+regressor. DDPO therefore uses within-context standardized advantages rather
+than treating its absolute predicted Q value as a calibrated return.
+
+Locked Period 26-27, seed `20260805`:
+
+| Policy | Continuous Score | Continuous Reward | Aggregate CPA | CPA violation | Budget utilization |
+|---|---:|---:|---:|---:|---:|
+| Round-1 starting policy | 325.61 | 33,487.10 | **6.882** | **22.92%** | 87.42% |
+| MLP Round-2 DDPO | 326.34 | **33,618.98** | 6.910 | 23.96% | **87.91%** |
+| **Transformer Round-2 DDPO** | **326.36** | 33,590.91 | 6.903 | 23.96% | 87.79% |
+
+Transformer Round 2 improves over Round 1 by `+0.75`, with paired-bootstrap
+95% CI `[+0.14,+1.38]` and `p=0.0153`. Transformer minus MLP Round 2 is only
+`+0.02`, CI `[-0.19,+0.25]`, `p=0.8780`. The Transformer scorer is viable for
+DDPO, but it does not significantly outperform the simpler MLP Episode-Q in
+closed-loop policy quality.

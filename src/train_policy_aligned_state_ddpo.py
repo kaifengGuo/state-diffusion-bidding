@@ -24,6 +24,10 @@ for root in [HERE, HERE.parent / "remote_bid_diffusion"]:
 from evaluate_auctionnet_offline import STATE_DIM  # noqa: E402
 from train_offline_bid_diffusion import DiffusionPolicy, gaussian_log_prob  # noqa: E402
 from train_policy_aligned_episode_q_model import EpisodeQModel  # noqa: E402
+from train_policy_aligned_transformer_episode_q import (  # noqa: E402
+    MODEL_NAME as TRANSFORMER_EPISODE_Q_MODEL,
+    PolicyConditionedTransformerEpisodeQ,
+)
 from train_state_chunk_reward_model import load_state_normalizer  # noqa: E402
 from train_state_diffusion import (  # noqa: E402
     KEEP_STATE_INDICES,
@@ -117,14 +121,28 @@ def load_policy(checkpoint_dir: Path, device: torch.device):
 def load_rm(checkpoint_dir: Path, device: torch.device):
     cfg = json.loads((checkpoint_dir / "config.json").read_text())
     metadata = json.loads((checkpoint_dir / "normalization.json").read_text())
-    if cfg.get("model") != "EpisodeQModel":
-        raise ValueError("DDPO requires the policy-aligned EpisodeQModel ensemble")
+    model_name = cfg.get("model")
+    if model_name not in {"EpisodeQModel", TRANSFORMER_EPISODE_Q_MODEL}:
+        raise ValueError("DDPO requires a policy-aligned Episode-Q ensemble")
     models = []
     for member in range(cfg["ensemble_size"]):
-        model = EpisodeQModel(metadata["input_dim"], cfg["hidden_dim"]).to(device)
+        if model_name == "EpisodeQModel":
+            model = EpisodeQModel(metadata["input_dim"], cfg["hidden_dim"]).to(device)
+            checkpoint_name = f"state_chunk_episode_q_{member}.pt"
+        else:
+            model = PolicyConditionedTransformerEpisodeQ(
+                state_dim=int(metadata["state_dim"]),
+                aux_dim=int(metadata["aux_dim"]),
+                hidden_dim=int(cfg["hidden_dim"]),
+                num_layers=int(cfg["num_layers"]),
+                num_heads=int(cfg["num_heads"]),
+                ff_dim=int(cfg["ff_dim"]),
+                dropout=float(cfg["dropout"]),
+            ).to(device)
+            checkpoint_name = f"transformer_episode_q_{member}.pt"
         model.load_state_dict(
             torch.load(
-                checkpoint_dir / f"state_chunk_episode_q_{member}.pt",
+                checkpoint_dir / checkpoint_name,
                 map_location=device,
                 weights_only=True,
             )
@@ -133,6 +151,7 @@ def load_rm(checkpoint_dir: Path, device: torch.device):
         for parameter in model.parameters():
             parameter.requires_grad = False
         models.append(model)
+    metadata = {**metadata, "model": model_name}
     mean = torch.as_tensor(metadata["feature_mean"], device=device)
     std = torch.as_tensor(metadata["feature_std"], device=device)
     return models, metadata, mean, std
@@ -165,8 +184,96 @@ def compose_episode_q_inputs(
 
 
 @torch.no_grad()
+def compose_transformer_episode_q_inputs(
+    context: torch.Tensor,
+    chunks: torch.Tensor,
+    metadata: dict,
+    policy_version: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    history_length = int(metadata["history_length"])
+    keep_indices = torch.as_tensor(
+        metadata["keep_state_indices"], dtype=torch.long, device=context.device
+    )
+    state_dim = len(keep_indices)
+    history_width = history_length * STATE_DIM
+    context_dim = int(metadata["context_dim"])
+    state_chunk_dim = int(metadata["state_chunk_dim"])
+    if context.shape[-1] != context_dim or chunks.shape[-1] != state_chunk_dim:
+        raise ValueError("Transformer Episode-Q context/chunk dimensions do not match")
+    if state_chunk_dim % state_dim:
+        raise ValueError("Transformer Episode-Q state chunk cannot be tokenized")
+
+    history = context[:, :history_width].reshape(
+        len(context), history_length, STATE_DIM
+    )[..., keep_indices]
+    future = chunks.reshape(len(chunks), state_chunk_dim // state_dim, state_dim)
+    states = torch.cat([history, future], dim=1)
+    valid_mask = torch.ones(
+        states.shape[:2], dtype=torch.bool, device=states.device
+    )
+
+    auxiliary = context[:, history_width:context_dim]
+    policy_version_dim = int(metadata.get("policy_version_dim", 0))
+    if policy_version_dim == 1:
+        version = torch.full(
+            (len(context), 1),
+            float(policy_version),
+            dtype=context.dtype,
+            device=context.device,
+        )
+        auxiliary = torch.cat([auxiliary, version], dim=-1)
+    elif policy_version_dim != 0:
+        raise ValueError("Transformer Episode-Q supports one policy-version feature")
+    if auxiliary.shape[-1] != int(metadata["aux_dim"]):
+        raise ValueError("Transformer Episode-Q auxiliary dimensions do not match")
+    aux_mean = torch.as_tensor(
+        metadata["aux_mean"], dtype=context.dtype, device=context.device
+    )
+    aux_std = torch.as_tensor(
+        metadata["aux_std"], dtype=context.dtype, device=context.device
+    )
+    return states, valid_mask, (auxiliary - aux_mean) / aux_std
+
+
+@torch.no_grad()
+def episode_q_member_predictions(
+    models: list[torch.nn.Module],
+    metadata: dict,
+    feature_mean: torch.Tensor,
+    feature_std: torch.Tensor,
+    context: torch.Tensor,
+    chunks: torch.Tensor,
+    policy_version: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    model_name = metadata.get("model", "EpisodeQModel")
+    if model_name == "EpisodeQModel":
+        features = compose_episode_q_inputs(
+            context, chunks, metadata, policy_version
+        )
+        normalized = (features - feature_mean) / feature_std
+        return torch.stack([model(normalized) for model in models]), normalized
+    if model_name != TRANSFORMER_EPISODE_Q_MODEL:
+        raise ValueError(f"Unknown Episode-Q model: {model_name}")
+
+    states, valid_mask, auxiliary = compose_transformer_episode_q_inputs(
+        context, chunks, metadata, policy_version
+    )
+    predictions = torch.stack(
+        [
+            model(states, valid_mask, auxiliary, int(metadata["history_length"]))
+            for model in models
+        ]
+    )
+    flat_features = torch.cat([context, chunks], dim=-1)
+    if flat_features.shape[-1] != len(feature_mean):
+        raise ValueError("Transformer Episode-Q support features do not match")
+    normalized = (flat_features - feature_mean) / feature_std
+    return predictions, normalized
+
+
+@torch.no_grad()
 def robust_rm_scores(
-    models: list[EpisodeQModel],
+    models: list[torch.nn.Module],
     metadata: dict,
     feature_mean: torch.Tensor,
     feature_std: torch.Tensor,
@@ -176,11 +283,16 @@ def robust_rm_scores(
     support_penalty: float,
     policy_version: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    features = compose_episode_q_inputs(
-        context, chunks, metadata, policy_version
+    member_predictions, normalized = episode_q_member_predictions(
+        models,
+        metadata,
+        feature_mean,
+        feature_std,
+        context,
+        chunks,
+        policy_version,
     )
-    normalized = (features - feature_mean) / feature_std
-    member_scores = torch.stack([model(normalized)[..., 2] for model in models])
+    member_scores = member_predictions[..., 2]
     mean = member_scores.mean(0)
     uncertainty = member_scores.std(0, unbiased=False)
     chunk_start = int(metadata["context_dim"])
@@ -193,7 +305,7 @@ def robust_rm_scores(
 
 @torch.no_grad()
 def constrained_episode_q_scores(
-    models: list[EpisodeQModel],
+    models: list[torch.nn.Module],
     metadata: dict,
     feature_mean: torch.Tensor,
     feature_std: torch.Tensor,
@@ -212,11 +324,15 @@ def constrained_episode_q_scores(
 
     if metadata.get("target_mode", "absolute") != "absolute":
         raise ValueError("Constraint penalties require an absolute Episode-Q model")
-    features = compose_episode_q_inputs(
-        context, chunks, metadata, policy_version
+    member_predictions, normalized = episode_q_member_predictions(
+        models,
+        metadata,
+        feature_mean,
+        feature_std,
+        context,
+        chunks,
+        policy_version,
     )
-    normalized = (features - feature_mean) / feature_std
-    member_predictions = torch.stack([model(normalized) for model in models])
     target_mean = torch.as_tensor(
         metadata["target_mean"], dtype=context.dtype, device=context.device
     )

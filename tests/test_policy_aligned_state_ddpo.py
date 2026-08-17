@@ -5,8 +5,10 @@ import numpy as np
 import torch
 
 from train_policy_aligned_state_ddpo import (
+    TRANSFORMER_EPISODE_Q_MODEL,
     adaptive_loss_weights,
     compose_episode_q_inputs,
+    compose_transformer_episode_q_inputs,
     constrained_episode_q_scores,
     grouped_advantages,
 )
@@ -110,6 +112,74 @@ class PolicyAlignedStateDDPOTest(unittest.TestCase):
         features = compose_episode_q_inputs(context, chunks, metadata, 1.5)
         self.assertEqual(tuple(features.shape), (3, 7))
         torch.testing.assert_close(features[:, -1], torch.full((3,), 1.5))
+
+    def test_transformer_episode_q_uses_state_tokens_and_auxiliary_version(self):
+        context = torch.arange(40, dtype=torch.float32).reshape(2, 20)
+        chunks = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        metadata = {
+            "history_length": 1,
+            "keep_state_indices": [0, 1],
+            "context_dim": 20,
+            "state_chunk_dim": 4,
+            "policy_version_dim": 1,
+            "aux_dim": 5,
+            "aux_mean": [0.0] * 5,
+            "aux_std": [1.0] * 5,
+        }
+        states, mask, auxiliary = compose_transformer_episode_q_inputs(
+            context, chunks, metadata, policy_version=1.5
+        )
+        self.assertEqual(tuple(states.shape), (2, 3, 2))
+        self.assertTrue(bool(mask.all()))
+        torch.testing.assert_close(states[:, 0], context[:, :2])
+        torch.testing.assert_close(states[:, 1:].reshape(2, 4), chunks)
+        torch.testing.assert_close(auxiliary[:, -1], torch.full((2,), 1.5))
+
+    def test_constrained_score_accepts_transformer_episode_q(self):
+        class FixedTransformer(torch.nn.Module):
+            def forward(self, states, valid_mask, auxiliary, history_length):
+                self.seen = (states.shape, valid_mask.shape, auxiliary.shape, history_length)
+                return torch.zeros(len(states), 3, device=states.device)
+
+        model = FixedTransformer()
+        context = torch.zeros(2, 20)
+        context[:, -4:] = torch.tensor([100.0, 2.0, 0.0, 0.0])
+        chunks = torch.zeros(2, 4)
+        metadata = {
+            "model": TRANSFORMER_EPISODE_Q_MODEL,
+            "target_mode": "absolute",
+            "target_transform": "log1p_nonnegative",
+            "target_mean": [1.0, 1.0, 1.0],
+            "target_std": [1.0, 1.0, 1.0],
+            "history_length": 1,
+            "keep_state_indices": [0, 1],
+            "context_dim": 20,
+            "state_chunk_dim": 4,
+            "policy_version_dim": 1,
+            "aux_dim": 5,
+            "aux_mean": [0.0] * 5,
+            "aux_std": [1.0] * 5,
+        }
+        normalizer = SimpleNamespace(
+            condition_mean=np.zeros(4, dtype=np.float32),
+            condition_std=np.ones(4, dtype=np.float32),
+        )
+        result = constrained_episode_q_scores(
+            [model, model],
+            metadata,
+            torch.zeros(24),
+            torch.ones(24),
+            context,
+            chunks,
+            normalizer,
+            uncertainty_beta=0.0,
+            support_penalty=0.0,
+            cpa_violation_weight=0.0,
+            budget_shortfall_weight=0.0,
+            budget_util_target=0.9,
+        )
+        self.assertEqual(tuple(result[0].shape), (2,))
+        self.assertEqual(model.seen, (torch.Size([2, 3, 2]), torch.Size([2, 3]), torch.Size([2, 5]), 1))
 
 
 if __name__ == "__main__":
