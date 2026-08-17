@@ -181,6 +181,52 @@ class PolicyAlignedStateDDPOTest(unittest.TestCase):
         self.assertEqual(tuple(result[0].shape), (2,))
         self.assertEqual(model.seen, (torch.Size([2, 3, 2]), torch.Size([2, 3]), torch.Size([2, 5]), 1))
 
+    def test_relative_transformer_score_bypasses_absolute_target_decode(self):
+        class RelativeTransformer(torch.nn.Module):
+            def forward(self, states, valid_mask, auxiliary, history_length):
+                output = torch.zeros(len(states), 3, device=states.device)
+                output[:, 2] = torch.tensor([2.0, -1.0], device=states.device)
+                return output
+
+        metadata = {
+            "model": TRANSFORMER_EPISODE_Q_MODEL,
+            "target_mode": "absolute",
+            "target_transform": "log1p_nonnegative",
+            "target_mean": [1.0, 1.0, 10.0],
+            "target_std": [1.0, 1.0, 5.0],
+            "score_target_mode": "within_group_advantage",
+            "history_length": 1,
+            "keep_state_indices": [0, 1],
+            "context_dim": 20,
+            "state_chunk_dim": 4,
+            "policy_version_dim": 1,
+            "aux_dim": 5,
+            "aux_mean": [0.0] * 5,
+            "aux_std": [1.0] * 5,
+        }
+        context = torch.zeros(2, 20)
+        context[:, -4:] = torch.tensor([100.0, 2.0, 0.0, 0.0])
+        normalizer = SimpleNamespace(
+            condition_mean=np.zeros(4, dtype=np.float32),
+            condition_std=np.ones(4, dtype=np.float32),
+        )
+        objective, score, *_ = constrained_episode_q_scores(
+            [RelativeTransformer(), RelativeTransformer()],
+            metadata,
+            torch.zeros(24),
+            torch.ones(24),
+            context,
+            torch.zeros(2, 4),
+            normalizer,
+            uncertainty_beta=0.0,
+            support_penalty=0.0,
+            cpa_violation_weight=0.0,
+            budget_shortfall_weight=0.0,
+            budget_util_target=0.9,
+        )
+        torch.testing.assert_close(score, torch.tensor([2.0, -1.0]))
+        torch.testing.assert_close(objective, score)
+
 
 if __name__ == "__main__":
     unittest.main()

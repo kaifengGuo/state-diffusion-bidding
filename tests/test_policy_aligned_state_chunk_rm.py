@@ -8,6 +8,7 @@ from train_policy_aligned_state_chunk_rm import (
     append_policy_version_features,
     compose_state_chunk_features,
     decode_single_actions,
+    select_active_candidate_indices,
 )
 
 
@@ -68,6 +69,25 @@ class PolicyAlignedStateChunkRMTest(unittest.TestCase):
         self.assertEqual(result.shape, (2, 3, 5))
         np.testing.assert_array_equal(result[0, :, -1], np.zeros(3))
         np.testing.assert_array_equal(result[1, :, -1], np.ones(3))
+
+    def test_active_selection_keeps_anchors_uncertainty_and_diversity(self):
+        member_scores = np.asarray(
+            [
+                [5.0, -5.0, 4.0, 0.0, 0.1, 0.2],
+                [5.0, -5.0, -4.0, 0.0, 0.1, 0.2],
+                [5.0, -5.0, 0.0, 0.0, 0.1, 0.2],
+            ],
+            dtype=np.float32,
+        )
+        chunks = np.asarray(
+            [[0.0, 0.0], [0.1, 0.1], [0.2, 0.2], [10.0, 0.0], [0.0, 10.0], [5.0, 5.0]],
+            dtype=np.float32,
+        )
+        selected = select_active_candidate_indices(member_scores, chunks, 4)
+        self.assertEqual(len(np.unique(selected)), 4)
+        self.assertIn(0, selected)
+        self.assertIn(1, selected)
+        self.assertIn(2, selected)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -49,6 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rollouts-per-advertiser", type=int, default=1)
     parser.add_argument("--advertiser-limit", type=int, default=None)
     parser.add_argument("--candidate-count", type=int, default=8)
+    parser.add_argument("--candidate-pool-size", type=int, default=None)
+    parser.add_argument("--active-rm-checkpoint-dir", default=None)
     parser.add_argument("--decision-stride", type=int, default=1)
     parser.add_argument("--max-groups-per-period", type=int, default=None)
     parser.add_argument("--policy-version", type=float, default=0.0)
@@ -129,6 +132,102 @@ def compose_state_chunk_features(
     return np.concatenate([context, chunks], axis=1).astype(np.float32)
 
 
+def select_active_candidate_indices(
+    member_scores: np.ndarray,
+    chunks: np.ndarray,
+    candidate_count: int,
+) -> np.ndarray:
+    """Keep score anchors, epistemically uncertain samples, and diverse states."""
+
+    member_scores = np.asarray(member_scores, dtype=np.float32)
+    chunks = np.asarray(chunks, dtype=np.float32)
+    if member_scores.ndim != 2 or chunks.ndim != 2:
+        raise ValueError("Active candidates require member-by-pool scores and chunks")
+    if member_scores.shape[1] != len(chunks):
+        raise ValueError("Active RM scores and state chunks must share the pool")
+    if not 1 <= candidate_count <= len(chunks):
+        raise ValueError("Active candidate count must fit inside the proposal pool")
+
+    mean = member_scores.mean(0)
+    uncertainty = member_scores.std(0)
+    selected: list[int] = []
+
+    def add(index: int) -> None:
+        index = int(index)
+        if index not in selected and len(selected) < candidate_count:
+            selected.append(index)
+
+    add(np.argmax(mean))
+    add(np.argmin(mean))
+    uncertainty_slots = max(candidate_count // 2, 1)
+    uncertainty_added = 0
+    for index in np.argsort(-uncertainty):
+        if uncertainty_added >= uncertainty_slots or len(selected) >= candidate_count:
+            break
+        before = len(selected)
+        add(index)
+        uncertainty_added += int(len(selected) > before)
+
+    normalized = (chunks - chunks.mean(0, keepdims=True)) / np.maximum(
+        chunks.std(0, keepdims=True), 1e-6
+    )
+    while len(selected) < candidate_count:
+        remaining = np.asarray(
+            [index for index in range(len(chunks)) if index not in selected],
+            dtype=np.int64,
+        )
+        if not len(selected):
+            add(remaining[0])
+            continue
+        distances = np.square(
+            normalized[remaining, None] - normalized[np.asarray(selected)][None]
+        ).mean(-1)
+        add(remaining[np.argmax(distances.min(axis=1))])
+    return np.asarray(selected, dtype=np.int64)
+
+
+@torch.inference_mode()
+def select_active_candidate_groups(
+    features: np.ndarray,
+    chunks: np.ndarray,
+    alphas: np.ndarray,
+    candidate_count: int,
+    active_rm,
+    policy_version: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    models, metadata, feature_mean, feature_std, prediction_fn = active_rm
+    groups, pool_size, _ = features.shape
+    flat_context = torch.from_numpy(
+        features[..., : int(metadata["context_dim"])].reshape(
+            groups * pool_size, int(metadata["context_dim"])
+        )
+    ).to(feature_mean.device)
+    flat_chunks = torch.from_numpy(chunks.reshape(groups * pool_size, -1)).to(
+        feature_mean.device
+    )
+    member_predictions, _ = prediction_fn(
+        models,
+        metadata,
+        feature_mean,
+        feature_std,
+        flat_context,
+        flat_chunks,
+        policy_version,
+    )
+    member_scores = member_predictions[..., 2].reshape(
+        len(models), groups, pool_size
+    ).cpu().numpy()
+    selected_features = []
+    selected_alphas = []
+    for group in range(groups):
+        indices = select_active_candidate_indices(
+            member_scores[:, group], chunks[group], candidate_count
+        )
+        selected_features.append(features[group, indices])
+        selected_alphas.append(alphas[group, indices])
+    return np.stack(selected_features), np.stack(selected_alphas)
+
+
 def append_policy_version_features(
     features: np.ndarray, policy_versions: np.ndarray
 ) -> np.ndarray:
@@ -180,6 +279,7 @@ def collect_period(
     idm,
     idm_normalizer,
     device: torch.device,
+    active_rm=None,
 ) -> dict[str, np.ndarray]:
     templates = load_templates(Path(args.auctionnet_root), period, args.seed)
     if args.advertiser_limit is not None:
@@ -210,7 +310,8 @@ def collect_period(
                         or len(snapshots) < args.max_groups_per_period
                     )
                 )
-                sample_count = args.candidate_count if collect_at_time else 1
+                proposal_count = args.candidate_pool_size or args.candidate_count
+                sample_count = proposal_count if collect_at_time else 1
                 built = [
                     state_condition(
                         replays[i], time_index, state_normalizer, state_cfg.history_length
@@ -235,12 +336,25 @@ def collect_period(
                     idm_normalizer,
                     device,
                 )
+                generated_chunks = generated.cpu().numpy().reshape(
+                    len(active), sample_count, -1
+                )
                 features = compose_state_chunk_features(
                     candidate_cond,
                     generated.cpu().numpy(),
                     state_cfg.horizon,
                 ).reshape(len(active), sample_count, -1)
                 alphas = candidate_alphas.reshape(len(active), sample_count)
+                executed_alphas = alphas[:, 0].copy()
+                if collect_at_time and active_rm is not None:
+                    features, alphas = select_active_candidate_groups(
+                        features,
+                        generated_chunks,
+                        alphas,
+                        args.candidate_count,
+                        active_rm,
+                        args.policy_version,
+                    )
                 for position, replay_index in enumerate(active):
                     replay = replays[replay_index]
                     should_collect = (
@@ -259,7 +373,7 @@ def collect_period(
                                 "candidate_alphas": alphas[position].copy(),
                             }
                         )
-                    base_alphas[replay_index, time_index] = alphas[position, 0]
+                    base_alphas[replay_index, time_index] = executed_alphas[position]
 
         for replay_index, replay in enumerate(replays):
             append_environment_step(
@@ -340,6 +454,19 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
                 parts.append(part)
     else:
         policy, state_cfg, state_normalizer, idm, idm_normalizer = load_policy(args, device)
+        active_rm = None
+        if getattr(args, "active_rm_checkpoint_dir", None):
+            scorer_path = HERE / "train_policy_aligned_state_ddpo.py"
+            spec = importlib.util.spec_from_file_location(
+                "policy_aligned_active_scorer", scorer_path
+            )
+            if spec is None or spec.loader is None:
+                raise ImportError(f"Cannot load active scorer from {scorer_path}")
+            scorer = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(scorer)
+
+            loaded = scorer.load_rm(Path(args.active_rm_checkpoint_dir), device)
+            active_rm = (*loaded, scorer.episode_q_member_predictions)
         periods = args.collect_periods or sorted(
             set(args.train_periods + args.val_periods + args.test_periods)
         )
@@ -354,6 +481,7 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
                     idm,
                     idm_normalizer,
                     device,
+                    active_rm,
                 )
             )
     if not parts:
@@ -464,6 +592,11 @@ def main() -> None:
         raise ValueError("decision-stride must be positive")
     if args.max_groups_per_period is not None and args.max_groups_per_period < 1:
         raise ValueError("max-groups-per-period must be positive")
+    if args.candidate_pool_size is not None:
+        if args.candidate_pool_size < args.candidate_count:
+            raise ValueError("candidate-pool-size must be at least candidate-count")
+        if not args.active_rm_checkpoint_dir:
+            raise ValueError("candidate-pool-size requires an active RM checkpoint")
     device = torch.device(args.device)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

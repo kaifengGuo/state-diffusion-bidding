@@ -151,3 +151,39 @@ Transformer Round 2 improves over Round 1 by `+0.75`, with paired-bootstrap
 `+0.02`, CI `[-0.19,+0.25]`, `p=0.8780`. The Transformer scorer is viable for
 DDPO, but it does not significantly outperform the simpler MLP Episode-Q in
 closed-loop policy quality.
+
+## Relative Episode-Q and Active Candidates
+
+The relative variant predicts within-context standardized terminal-score
+advantage while retaining absolute Reward and Cost auxiliary heads. It uses
+Smooth-L1 advantage regression, pairwise ranking, and a low-weight listwise
+objective.
+
+Active collection samples 32 policy candidates per context and keeps eight
+combining predicted high/low anchors, ensemble disagreement, and farthest-point
+state-chunk diversity. Only Periods 7-24 are recollected; Period 25 and Periods
+26-27 remain unchanged.
+
+The 5,743 additional groups increase the training split from 8,218 to 13,961.
+Compared with random candidates:
+
+| Training-candidate statistic | Random | Active |
+|---|---:|---:|
+| True within-group Score std | 2.47 | **3.68** |
+| True top-1/top-2 Score gap | 1.72 | **2.37** |
+| Mean state-chunk distance | 0.131 | **0.182** |
+
+| Metric | Relative | Relative + Active |
+|---|---:|---:|
+| Period 25 pairwise accuracy | 74.87% | **75.73%** |
+| Period 25 top-1 regret | 0.81 | **0.65** |
+| Period 26-27 pairwise accuracy | 65.13% | **67.50%** |
+| Period 26-27 top-1 regret | 1.95 | **1.78** |
+| Period 26-27 advantage R2 | -0.021 | **0.090** |
+
+One-round DDPO with the active relative RM reaches `309.22` on Period 25,
+versus `308.08` for its Round-1 starting policy and `309.39` for MLP Round 2.
+It trails MLP by `-0.16`, paired-bootstrap CI `[-0.54,+0.12]`, `p=0.3410`.
+Because it failed the predeclared Period-25 policy gate, it was not evaluated
+on Periods 26-27. Active data fixes much of the RM generalization gap, while
+the remaining bottleneck is the DDPO policy update.

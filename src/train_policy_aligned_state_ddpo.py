@@ -369,7 +369,10 @@ def constrained_episode_q_scores(
         )
         member_score_log = torch.log1p(member_reward * member_penalty)
     elif score_source == "direct":
-        member_score_log = transformed[..., 2]
+        if metadata.get("score_target_mode", "absolute") == "within_group_advantage":
+            member_score_log = member_predictions[..., 2]
+        else:
+            member_score_log = transformed[..., 2]
     else:
         raise ValueError(f"Unknown score source: {score_source}")
     score_log = member_score_log.mean(0)

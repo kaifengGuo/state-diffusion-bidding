@@ -64,6 +64,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--rank-weight", type=float, default=0.5)
+    parser.add_argument("--listwise-weight", type=float, default=0.0)
+    parser.add_argument("--listwise-temperature", type=float, default=1.0)
+    parser.add_argument("--reward-cost-weight", type=float, default=1.0)
+    parser.add_argument("--score-reg-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--score-target-mode",
+        choices=["absolute", "within_group_advantage"],
+        default="absolute",
+    )
     parser.add_argument(
         "--selection-metric",
         choices=["mse", "score_pairwise"],
@@ -80,6 +89,29 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def standardize_within_group(values: np.ndarray, epsilon: float = 1e-6) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    if values.ndim != 2:
+        raise ValueError("Grouped values must have [groups, candidates] shape")
+    centered = values - values.mean(axis=1, keepdims=True)
+    scale = values.std(axis=1, keepdims=True)
+    return (centered / np.maximum(scale, epsilon)).astype(np.float32)
+
+
+def listwise_ranking_loss(
+    predicted_scores: torch.Tensor,
+    target_scores: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    if temperature <= 0:
+        raise ValueError("Listwise temperature must be positive")
+    target_distribution = F.softmax(target_scores / temperature, dim=-1)
+    predicted_log_distribution = F.log_softmax(
+        predicted_scores / temperature, dim=-1
+    )
+    return -(target_distribution * predicted_log_distribution).sum(-1).mean()
 
 
 class PolicyConditionedTransformerEpisodeQ(nn.Module):
@@ -214,6 +246,9 @@ def prepare_data(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
     data["states"] = states
     data["masks"] = masks
     data["auxiliary"] = ((auxiliary - aux_mean) / aux_std).astype(np.float32)
+    if args.score_target_mode == "within_group_advantage":
+        data["targets"] = data["targets"].copy()
+        data["targets"][..., 2] = standardize_within_group(data["scores"])
     metadata = {
         **base_metadata,
         "model": MODEL_NAME,
@@ -226,6 +261,7 @@ def prepare_data(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
         "keep_state_indices": KEEP_STATE_INDICES.tolist(),
         "policy_version_dim": 1,
         "current_policy_version": float(args.policy_version),
+        "score_target_mode": args.score_target_mode,
         "input_contract": "history_and_future_state_tokens_plus_policy_context_and_version",
     }
     return data, metadata
@@ -310,9 +346,30 @@ def train_member(args: argparse.Namespace, data: dict, metadata: dict, member: i
             targets = targets.to(device)
             prediction = model(states, masks, auxiliary, int(metadata["history_length"]))
             prediction = prediction.reshape(*targets.shape)
-            regression = F.smooth_l1_loss(prediction, targets, beta=0.5)
+            if args.score_target_mode == "within_group_advantage":
+                reward_cost_regression = F.smooth_l1_loss(
+                    prediction[..., :2], targets[..., :2], beta=0.5
+                )
+                score_regression = F.smooth_l1_loss(
+                    prediction[..., 2], targets[..., 2], beta=0.5
+                )
+                regression = (
+                    args.reward_cost_weight * reward_cost_regression
+                    + args.score_reg_weight * score_regression
+                )
+            else:
+                regression = F.smooth_l1_loss(prediction, targets, beta=0.5)
             rank = ranking_loss(prediction[..., 2], targets[..., 2])
-            loss = regression + args.rank_weight * rank
+            listwise = listwise_ranking_loss(
+                prediction[..., 2],
+                targets[..., 2],
+                args.listwise_temperature,
+            )
+            loss = (
+                regression
+                + args.rank_weight * rank
+                + args.listwise_weight * listwise
+            )
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -408,7 +465,9 @@ def evaluate(models, data: dict, mask: np.ndarray, metadata: dict, device: torch
         [data["rewards"][mask], data["costs"][mask], data["scores"][mask]], axis=-1
     )
     metrics = {"groups": int(mask.sum()), "rows": int(mask.sum() * prediction.shape[1])}
-    for index, name in enumerate(metadata["target_names"]):
+    score_target_mode = metadata.get("score_target_mode", "absolute")
+    regression_head_count = 2 if score_target_mode == "within_group_advantage" else 3
+    for index, name in enumerate(metadata["target_names"][:regression_head_count]):
         error = prediction[..., index] - targets[..., index]
         centered = targets[..., index] - targets[..., index].mean()
         metrics[f"{name}_mae"] = float(np.abs(error).mean())
@@ -418,7 +477,23 @@ def evaluate(models, data: dict, mask: np.ndarray, metadata: dict, device: torch
         metrics[f"{name}_pairwise_accuracy"] = pairwise_accuracy(
             prediction[..., index], targets[..., index]
         )
-    selected = prediction[..., 2].argmax(axis=1)
+    if score_target_mode == "within_group_advantage":
+        score_prediction = normalized_members[..., 2].mean(0)
+        advantage_target = data["targets"][mask][..., 2]
+        advantage_error = score_prediction - advantage_target
+        advantage_centered = advantage_target - advantage_target.mean()
+        metrics["score_advantage_mae"] = float(np.abs(advantage_error).mean())
+        metrics["score_advantage_r2"] = float(
+            1.0
+            - np.sum(advantage_error**2)
+            / max(np.sum(advantage_centered**2), 1e-8)
+        )
+        metrics["competition_score_pairwise_accuracy"] = pairwise_accuracy(
+            score_prediction, targets[..., 2]
+        )
+    else:
+        score_prediction = prediction[..., 2]
+    selected = score_prediction.argmax(axis=1)
     target_scores = targets[..., 2]
     metrics["score_top1_regret"] = float(
         np.mean(target_scores.max(1) - target_scores[np.arange(len(selected)), selected])
@@ -463,6 +538,15 @@ def load_models(args: argparse.Namespace, metadata: dict, device: torch.device):
 
 def main() -> None:
     args = parse_args()
+    if min(
+        args.rank_weight,
+        args.listwise_weight,
+        args.reward_cost_weight,
+        args.score_reg_weight,
+    ) < 0:
+        raise ValueError("Episode-Q loss weights must be nonnegative")
+    if args.listwise_temperature <= 0:
+        raise ValueError("Listwise temperature must be positive")
     if args.member_index is not None and not 0 <= args.member_index < args.ensemble_size:
         raise ValueError("member-index must be within ensemble-size")
     device = torch.device(args.device)

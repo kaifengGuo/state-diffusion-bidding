@@ -264,12 +264,36 @@ python src/train_policy_aligned_transformer_episode_q.py \
   --test-periods 26 27 \
   --ensemble-size 5 \
   --learning-rate 3e-4 \
-  --rank-weight 1 \
+  --rank-weight 0.5 \
+  --listwise-weight 0.25 \
+  --reward-cost-weight 0.25 \
+  --score-target-mode within_group_advantage \
   --selection-metric score_pairwise
 ```
 
 Point `--state-rm-checkpoint-dir` at either the residual MLP or Transformer
 Episode-Q directory; the DDPO scorer detects the model contract automatically.
+
+The collector can also propose a larger candidate pool and use a trained
+Episode-Q ensemble to retain score anchors, uncertain candidates, and diverse
+state chunks before closed-loop labeling:
+
+```bash
+python src/train_policy_aligned_state_chunk_rm.py \
+  --auctionnet-root /path/to/AuctionNet \
+  --state-checkpoint-dir outputs/state_h3_k5_episode_q_ddpo \
+  --idm-checkpoint-dir outputs/idm_h3 \
+  --output-dir outputs/episode_q_active \
+  --collect-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --collect-only \
+  --candidate-count 8 \
+  --candidate-pool-size 32 \
+  --active-rm-checkpoint-dir outputs/transformer_episode_q \
+  --policy-version 1.0
+```
+
+Keep validation and test datasets fixed; active collection should augment only
+the RM training periods.
 
 Use those counterfactual contexts for one conservative DDPO update:
 

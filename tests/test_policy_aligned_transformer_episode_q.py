@@ -4,6 +4,8 @@ import torch
 from train_policy_aligned_transformer_episode_q import (
     PolicyConditionedTransformerEpisodeQ,
     build_transformer_inputs,
+    listwise_ranking_loss,
+    standardize_within_group,
 )
 
 
@@ -59,3 +61,18 @@ def test_flat_policy_features_become_state_tokens_and_versioned_auxiliary():
     assert auxiliary.shape == (2, 3, 7)
     np.testing.assert_array_equal(auxiliary[0, :, -1], np.zeros(3))
     np.testing.assert_array_equal(auxiliary[1, :, -1], np.ones(3))
+
+
+def test_within_group_advantages_are_centered_and_handle_ties():
+    values = np.asarray([[1.0, 2.0, 3.0], [4.0, 4.0, 4.0]], dtype=np.float32)
+    advantages = standardize_within_group(values)
+    np.testing.assert_allclose(advantages[0].mean(), 0.0, atol=1e-6)
+    np.testing.assert_allclose(advantages[0].std(), 1.0, atol=1e-6)
+    np.testing.assert_array_equal(advantages[1], np.zeros(3, dtype=np.float32))
+
+
+def test_listwise_loss_prefers_the_target_ordering():
+    target = torch.tensor([[-1.0, 0.0, 1.0]])
+    aligned = listwise_ranking_loss(target, target)
+    reversed_order = listwise_ranking_loss(-target, target)
+    assert aligned < reversed_order
