@@ -77,3 +77,39 @@ Continuous Reward improves by +1.77 per episode with 95% CI
 [+0.75, +2.90]. Budget utilization improves by +0.53 percentage points. The
 continuous CPA violation rate is unchanged; raw aggregate CPA increases by
 0.029.
+
+## Alternating Round 2
+
+Round 2 refreshes the counterfactual dataset under the Round-1 policy before
+performing another DDPO update. The Episode-Q input adds a scalar policy-version
+condition. Training uses 70% Round-1-policy groups and 30% Base-policy replay;
+validation and test labels use only the Round-1 continuation policy.
+
+The refreshed five-member RM reaches:
+
+| Split | Score pairwise accuracy | Top-1 regret | Uncertainty/error correlation |
+|---|---:|---:|---:|
+| Period 25 | 69.79% | 0.95 | 0.385 |
+| Period 26-27 | 64.61% | 1.99 | 0.368 |
+
+Period-25 Continuous Score increases from 308.08 after Round 1 to 309.39 after
+Round 2. Three new AuctionNet replay seeds are used for the final comparison,
+giving 288 seed/advertiser episodes:
+
+| Method | Continuous Score | Mean continuous reward | Aggregate CPA | CPA violation | Budget utilization |
+|---|---:|---:|---:|---:|---:|
+| Base N=1 | 321.96 | 344.28 | **6.823** | **23.61%** | 86.58% |
+| Round-1 DDPO N=1 | 323.12 | 346.00 | 6.848 | **23.61%** | 87.09% |
+| **Round-2 DDPO N=1** | **324.07** | **347.41** | 6.873 | 23.96% | **87.53%** |
+
+Advertiser-cluster bootstrap, averaging the three replay seeds within each
+advertiser before resampling:
+
+- Round 1 minus Base: `+1.17`, 95% CI `[+0.50, +1.86]`, `p=0.00044`.
+- Round 2 minus Round 1: `+0.95`, 95% CI `[+0.20, +1.75]`, `p=0.0122`.
+- Round 2 minus Base: `+2.12`, 95% CI `[+0.73, +3.57]`, `p=0.0022`.
+
+Round 2 raises aggregate CPA by 0.038 versus Base. Mean continuous CPA
+violation increases by 0.35 percentage points, with a cluster-bootstrap
+interval of `[0.00, 1.04]` percentage points; this safety tradeoff should be
+reported with the score gain.

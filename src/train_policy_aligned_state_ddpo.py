@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-source", choices=["direct", "reward_cost"], default="direct"
     )
+    parser.add_argument("--policy-version", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return parser.parse_args()
@@ -138,6 +139,32 @@ def load_rm(checkpoint_dir: Path, device: torch.device):
 
 
 @torch.no_grad()
+def compose_episode_q_inputs(
+    context: torch.Tensor,
+    chunks: torch.Tensor,
+    metadata: dict,
+    policy_version: float,
+) -> torch.Tensor:
+    features = torch.cat([context, chunks], dim=-1)
+    policy_version_dim = int(metadata.get("policy_version_dim", 0))
+    if policy_version_dim == 1:
+        version = torch.full(
+            (len(features), 1),
+            float(policy_version),
+            dtype=features.dtype,
+            device=features.device,
+        )
+        features = torch.cat([features, version], dim=-1)
+    elif policy_version_dim != 0:
+        raise ValueError("Episode-Q supports at most one policy-version feature")
+    if features.shape[-1] != int(metadata["input_dim"]):
+        raise ValueError(
+            f"Expected {metadata['input_dim']} Episode-Q features, got {features.shape[-1]}"
+        )
+    return features
+
+
+@torch.no_grad()
 def robust_rm_scores(
     models: list[EpisodeQModel],
     metadata: dict,
@@ -147,13 +174,18 @@ def robust_rm_scores(
     chunks: torch.Tensor,
     uncertainty_beta: float,
     support_penalty: float,
+    policy_version: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    features = torch.cat([context, chunks], dim=-1)
+    features = compose_episode_q_inputs(
+        context, chunks, metadata, policy_version
+    )
     normalized = (features - feature_mean) / feature_std
     member_scores = torch.stack([model(normalized)[..., 2] for model in models])
     mean = member_scores.mean(0)
     uncertainty = member_scores.std(0, unbiased=False)
-    normalized_chunks = normalized[..., int(metadata["context_dim"]) :]
+    chunk_start = int(metadata["context_dim"])
+    chunk_end = chunk_start + int(metadata["state_chunk_dim"])
+    normalized_chunks = normalized[..., chunk_start:chunk_end]
     support = F.relu(normalized_chunks.abs() - 3.0).mean(-1)
     robust = mean - uncertainty_beta * uncertainty - support_penalty * support
     return robust, mean, uncertainty, support
@@ -174,12 +206,15 @@ def constrained_episode_q_scores(
     budget_shortfall_weight: float,
     budget_util_target: float,
     score_source: str = "direct",
+    policy_version: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build a conservative score objective from the RM reward/cost/score heads."""
 
     if metadata.get("target_mode", "absolute") != "absolute":
         raise ValueError("Constraint penalties require an absolute Episode-Q model")
-    features = torch.cat([context, chunks], dim=-1)
+    features = compose_episode_q_inputs(
+        context, chunks, metadata, policy_version
+    )
     normalized = (features - feature_mean) / feature_std
     member_predictions = torch.stack([model(normalized) for model in models])
     target_mean = torch.as_tensor(
@@ -198,7 +233,8 @@ def constrained_episode_q_scores(
     cost = member_cost.mean(0)
 
     context_dim = int(metadata["context_dim"])
-    normalized_chunks = normalized[..., context_dim:]
+    chunk_end = context_dim + int(metadata["state_chunk_dim"])
+    normalized_chunks = normalized[..., context_dim:chunk_end]
     support = F.relu(normalized_chunks.abs() - 3.0).mean(-1)
     condition_mean = torch.as_tensor(
         state_normalizer.condition_mean, dtype=context.dtype, device=context.device
@@ -370,6 +406,7 @@ def main() -> None:
                 args.budget_shortfall_weight,
                 args.budget_util_target,
                 args.score_source,
+                args.policy_version,
             )
             advantages = grouped_advantages(robust, args.group_size)
             rl_weight, ntp_weight = adaptive_loss_weights(

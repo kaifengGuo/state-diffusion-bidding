@@ -6,6 +6,7 @@ import torch
 
 from train_policy_aligned_state_ddpo import (
     adaptive_loss_weights,
+    compose_episode_q_inputs,
     constrained_episode_q_scores,
     grouped_advantages,
 )
@@ -48,6 +49,8 @@ class PolicyAlignedStateDDPOTest(unittest.TestCase):
             "target_mean": [0.0, 0.0, 0.0],
             "target_std": [1.0, 1.0, 1.0],
             "context_dim": 6,
+            "state_chunk_dim": 2,
+            "input_dim": 8,
         }
         context = torch.zeros(2, 6)
         context[:, -4:] = torch.tensor([100.0, 2.0, 0.0, 0.0])
@@ -94,6 +97,19 @@ class PolicyAlignedStateDDPOTest(unittest.TestCase):
             score_source="reward_cost",
         )[0]
         self.assertGreater(float(derived_objective[0]), float(derived_objective[1]))
+
+    def test_policy_version_is_appended_for_snapshot_conditioned_rm(self):
+        context = torch.zeros(3, 4)
+        chunks = torch.zeros(3, 2)
+        metadata = {
+            "context_dim": 4,
+            "state_chunk_dim": 2,
+            "policy_version_dim": 1,
+            "input_dim": 7,
+        }
+        features = compose_episode_q_inputs(context, chunks, metadata, 1.5)
+        self.assertEqual(tuple(features.shape), (3, 7))
+        torch.testing.assert_close(features[:, -1], torch.full((3,), 1.5))
 
 
 if __name__ == "__main__":

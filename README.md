@@ -71,6 +71,7 @@ src/train_transformer_state_chunk_rm.py   dynamic Transformer RM training
 src/train_transformer_state_ddpo.py       DDPO-IS policy post-training
 src/train_policy_aligned_state_chunk_rm.py closed-loop Episode-Q collection/training
 src/train_policy_aligned_state_ddpo.py     conservative Episode-Q DDPO
+src/build_policy_snapshot_mixture.py       mix current/base policy RM datasets
 src/evaluate_state_chunk_best_of_n.py     receding-horizon Best-of-N evaluation
 src/evaluate_auctionnet_offline.py         deterministic AuctionNet replay
 baselines/evaluate_cbd.py                  adapter for an external CBD checkout
@@ -266,6 +267,25 @@ On the locked Period 26-27 `N=1` test, this one-step update moves Continuous
 Score from `324.27` to `325.61`, with paired bootstrap 95% CI
 `[+0.42, +2.39]` and `p=0.0025`; continuous CPA violation is unchanged. See
 [`docs/POLICY_CONSISTENT_DDPO_RESULTS.md`](docs/POLICY_CONSISTENT_DDPO_RESULTS.md).
+
+For another alternating round, recollect with the updated policy and assign it
+a new scalar policy version. Mix current-policy and Base groups only in the RM
+training periods; validation and test should remain current-policy only:
+
+```bash
+python src/build_policy_snapshot_mixture.py \
+  --base-files outputs/episode_q_base/policy_aligned_state_chunk_period_*.npz \
+  --recent-files outputs/episode_q_round1/policy_aligned_state_chunk_period_*.npz \
+  --output-dir outputs/episode_q_round2_mixture \
+  --mix-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --recent-fraction 0.7
+```
+
+Train the refreshed RM with `--include-policy-version --policy-version 1.0`,
+then pass the same `--policy-version 1.0` to DDPO. Across three new Period 26-27
+replay seeds, the alternating Round-2 policy improves Continuous Score over
+Base by `+2.12`, advertiser-cluster bootstrap 95% CI `[+0.73, +3.57]`,
+`p=0.0022`. See the results document for the CPA tradeoff.
 
 ## Optional CBD Adapter
 

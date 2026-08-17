@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-count", type=int, default=8)
     parser.add_argument("--decision-stride", type=int, default=1)
     parser.add_argument("--max-groups-per-period", type=int, default=None)
+    parser.add_argument("--policy-version", type=float, default=0.0)
+    parser.add_argument("--include-policy-version", action="store_true")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-groups", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=512)
@@ -125,6 +127,19 @@ def compose_state_chunk_features(
             f"Expected {expected_chunk_dim} state-chunk dimensions, got {chunks.shape[1]}"
         )
     return np.concatenate([context, chunks], axis=1).astype(np.float32)
+
+
+def append_policy_version_features(
+    features: np.ndarray, policy_versions: np.ndarray
+) -> np.ndarray:
+    features = np.asarray(features, dtype=np.float32)
+    versions = np.asarray(policy_versions, dtype=np.float32).reshape(-1)
+    if features.ndim != 3 or len(features) != len(versions):
+        raise ValueError("Policy versions must align with grouped RM features")
+    version_feature = np.broadcast_to(
+        versions[:, None, None], (*features.shape[:2], 1)
+    )
+    return np.concatenate([features, version_feature], axis=-1).astype(np.float32)
 
 
 @torch.inference_mode()
@@ -289,6 +304,9 @@ def collect_period(
         "scores": np.stack(score_groups).astype(np.float32),
         "periods": np.full(len(feature_groups), period, dtype=np.int64),
         "groups": np.arange(len(feature_groups), dtype=np.int64),
+        "policy_versions": np.full(
+            len(feature_groups), args.policy_version, dtype=np.float32
+        ),
     }
     print(
         "COLLECT_POLICY_ALIGNED_STATE_RM "
@@ -310,12 +328,16 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
     if args.dataset_files:
         for path in args.dataset_files:
             with np.load(path) as payload:
-                parts.append(
-                    {
-                        key: payload[key]
-                        for key in ["features", "rewards", "costs", "scores", "periods", "groups"]
-                    }
+                part = {
+                    key: payload[key]
+                    for key in ["features", "rewards", "costs", "scores", "periods", "groups"]
+                }
+                part["policy_versions"] = (
+                    payload["policy_versions"]
+                    if "policy_versions" in payload.files
+                    else np.zeros(len(part["features"]), dtype=np.float32)
                 )
+                parts.append(part)
     else:
         policy, state_cfg, state_normalizer, idm, idm_normalizer = load_policy(args, device)
         periods = args.collect_periods or sorted(
@@ -338,6 +360,10 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
         raise ValueError("No policy-aligned state-chunk datasets were collected or loaded")
     group_offset = 0
     for part in parts:
+        if "policy_versions" not in part:
+            part["policy_versions"] = np.full(
+                len(part["features"]), args.policy_version, dtype=np.float32
+            )
         part["groups"] = np.arange(
             group_offset, group_offset + len(part["features"]), dtype=np.int64
         )
@@ -355,10 +381,32 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
     ]:
         if not mask.any():
             raise ValueError(f"The {name} split contains no candidate groups")
-    flat_train = data["features"][train_mask].reshape(-1, data["features"].shape[-1])
+    state_config = json.loads(
+        (Path(args.state_checkpoint_dir) / "config.json").read_text()
+    )
+    horizon = int(state_config["horizon"])
+    expected_chunk_dim = horizon * len(KEEP_STATE_INDICES)
+    raw_feature_dim = int(data["features"].shape[-1])
+    if raw_feature_dim <= expected_chunk_dim:
+        raise ValueError("RM input is missing its policy context")
+    context_dim = raw_feature_dim - expected_chunk_dim
+    _, state_normalizer = load_state_normalizer(Path(args.state_checkpoint_dir))
+    normalized_conditions = data["features"][:, 0, context_dim - 4 : context_dim]
+    raw_conditions = (
+        normalized_conditions * state_normalizer.condition_std
+        + state_normalizer.condition_mean
+    )
+    data["cpa_constraints"] = raw_conditions[:, 1].astype(np.float32)
+    model_features = data["features"]
+    policy_version_dim = int(args.include_policy_version)
+    if args.include_policy_version:
+        model_features = append_policy_version_features(
+            data["features"], data["policy_versions"]
+        )
+    flat_train = model_features[train_mask].reshape(-1, model_features.shape[-1])
     feature_mean = flat_train.mean(0)
     feature_std = np.maximum(flat_train.std(0), 1e-6)
-    data["inputs"] = ((data["features"] - feature_mean) / feature_std).astype(np.float32)
+    data["inputs"] = ((model_features - feature_mean) / feature_std).astype(np.float32)
     raw_targets = np.stack([data["rewards"], data["costs"], data["scores"]], axis=-1)
     transformed = np.log1p(np.maximum(raw_targets, 0.0))
     train_targets = transformed[train_mask].reshape(-1, 3)
@@ -368,22 +416,6 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
     data["train_mask"] = train_mask
     data["val_mask"] = val_mask
     data["test_mask"] = test_mask
-    state_config = json.loads(
-        (Path(args.state_checkpoint_dir) / "config.json").read_text()
-    )
-    horizon = int(state_config["horizon"])
-    expected_input_dim = int(data["features"].shape[-1])
-    expected_chunk_dim = horizon * len(KEEP_STATE_INDICES)
-    if expected_input_dim <= expected_chunk_dim:
-        raise ValueError("RM input is missing its policy context")
-    context_dim = expected_input_dim - expected_chunk_dim
-    _, state_normalizer = load_state_normalizer(Path(args.state_checkpoint_dir))
-    normalized_conditions = data["features"][:, 0, context_dim - 4 : context_dim]
-    raw_conditions = (
-        normalized_conditions * state_normalizer.condition_std
-        + state_normalizer.condition_mean
-    )
-    data["cpa_constraints"] = raw_conditions[:, 1].astype(np.float32)
     metadata = {
         "feature_mean": feature_mean.tolist(),
         "feature_std": feature_std.tolist(),
@@ -396,8 +428,14 @@ def load_dataset(args: argparse.Namespace, device: torch.device) -> tuple[dict, 
         "horizon": horizon,
         "state_chunk_dim": expected_chunk_dim,
         "context_dim": context_dim,
+        "policy_version_dim": policy_version_dim,
+        "current_policy_version": float(args.policy_version),
         "candidate_count": args.candidate_count,
-        "input_contract": "normalized_policy_context_plus_generated_state_chunk_only",
+        "input_contract": (
+            "normalized_policy_context_plus_generated_state_chunk_plus_policy_version"
+            if args.include_policy_version
+            else "normalized_policy_context_plus_generated_state_chunk_only"
+        ),
         "continuation": "candidate first action, then current-policy closed-loop replanning",
     }
     return data, metadata
@@ -435,7 +473,18 @@ def main() -> None:
             mask = data["periods"] == period
             np.savez_compressed(
                 output_dir / f"policy_aligned_state_chunk_period_{int(period)}.npz",
-                **{key: data[key][mask] for key in ["features", "rewards", "costs", "scores", "periods", "groups"]},
+                **{
+                    key: data[key][mask]
+                    for key in [
+                        "features",
+                        "rewards",
+                        "costs",
+                        "scores",
+                        "periods",
+                        "groups",
+                        "policy_versions",
+                    ]
+                },
             )
     if args.collect_only:
         print("COLLECT_ONLY_DONE", flush=True)

@@ -5,6 +5,7 @@ import numpy as np
 import torch
 
 from train_policy_aligned_state_chunk_rm import (
+    append_policy_version_features,
     compose_state_chunk_features,
     decode_single_actions,
 )
@@ -58,6 +59,15 @@ class PolicyAlignedStateChunkRMTest(unittest.TestCase):
         self.assertEqual(model.last_input_shape, (3, 84))
         self.assertEqual(actions.shape, (3,))
         np.testing.assert_array_equal(actions, np.arange(3, dtype=np.float32))
+
+    def test_policy_version_is_broadcast_to_every_candidate(self):
+        features = np.zeros((2, 3, 4), dtype=np.float32)
+        result = append_policy_version_features(
+            features, np.asarray([0.0, 1.0], dtype=np.float32)
+        )
+        self.assertEqual(result.shape, (2, 3, 5))
+        np.testing.assert_array_equal(result[0, :, -1], np.zeros(3))
+        np.testing.assert_array_equal(result[1, :, -1], np.ones(3))
 
 
 if __name__ == "__main__":
