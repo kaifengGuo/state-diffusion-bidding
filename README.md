@@ -29,6 +29,16 @@ This repository intentionally contains only model, training, evaluation, and tes
 - **Optional DDPO-IS:** post-trains every stochastic reverse-diffusion transition with
   Transformer-RM reward, a clipped importance-sampling objective, adaptive NTP
   anchoring, and reference-denoiser regularization.
+- **Policy-consistent Episode-Q:** labels candidate chunks by executing their
+  first IDM bid and replanning with the current policy to the end of the
+  AuctionNet episode. Counterfactual candidates share continuation diffusion
+  noise to reduce label variance.
+- **Transformer Episode-Q ablation:** tokenizes historical and candidate future
+  states, conditions on policy version and auction context, and can replace the
+  residual MLP scorer in policy-aligned DDPO.
+- **Relative Episode-Q with active candidates:** learns within-context
+  advantage from score anchors, ensemble-disagreement cases, and diverse state
+  chunks, then supports repeated on-policy DDPO refreshes.
 
 DDPO and Best-of-N are independent. DDPO changes the policy parameters during
 post-training; Best-of-N ranks samples at inference. The released DDPO experiment
@@ -65,6 +75,10 @@ src/train_state_diffusion.py              state-chunk diffusion training
 src/train_single_step_idm.py              single-bid inverse dynamics training
 src/train_transformer_state_chunk_rm.py   dynamic Transformer RM training
 src/train_transformer_state_ddpo.py       DDPO-IS policy post-training
+src/train_policy_aligned_state_chunk_rm.py closed-loop Episode-Q collection/training
+src/train_policy_aligned_transformer_episode_q.py sequence Episode-Q ensemble training
+src/train_policy_aligned_state_ddpo.py     conservative Episode-Q DDPO
+src/build_policy_snapshot_mixture.py       mix current/base policy RM datasets
 src/evaluate_state_chunk_best_of_n.py     receding-horizon Best-of-N evaluation
 src/evaluate_auctionnet_offline.py         deterministic AuctionNet replay
 baselines/evaluate_cbd.py                  adapter for an external CBD checkout
@@ -215,6 +229,124 @@ The locked Period 26-27 `N=1` comparison was `324.27` before DDPO and
 `[-0.01, +7.22]`; this is a promising but borderline result. See
 [`docs/DDPO_RESULTS.md`](docs/DDPO_RESULTS.md) for the full protocol and risk
 metrics.
+
+## Policy-Consistent Episode-Q
+
+The stricter alternative trains the RM on current-policy closed-loop AuctionNet
+returns instead of logged short-horizon returns or frozen base-policy
+continuations:
+
+```bash
+python src/train_policy_aligned_state_chunk_rm.py \
+  --auctionnet-root /path/to/AuctionNet \
+  --state-checkpoint-dir outputs/state_h3_k5 \
+  --idm-checkpoint-dir outputs/idm_h3 \
+  --output-dir outputs/episode_q \
+  --train-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --val-periods 25 \
+  --test-periods 26 27 \
+  --candidate-count 8 \
+  --ensemble-size 5 \
+  --rank-weight 0.5
+```
+
+The collector writes one `policy_aligned_state_chunk_period_*.npz` file per
+period.
+
+The same collected files can train the optional sequence-aware Episode-Q
+ensemble. It supports padded runtime token lengths and selects checkpoints by
+candidate-ranking accuracy:
+
+```bash
+python src/train_policy_aligned_transformer_episode_q.py \
+  --state-checkpoint-dir outputs/state_h3_k5 \
+  --dataset-files outputs/episode_q/policy_aligned_state_chunk_period_*.npz \
+  --output-dir outputs/transformer_episode_q \
+  --train-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --val-periods 25 \
+  --test-periods 26 27 \
+  --ensemble-size 5 \
+  --learning-rate 3e-4 \
+  --rank-weight 0.5 \
+  --listwise-weight 0.25 \
+  --reward-cost-weight 0.25 \
+  --score-target-mode within_group_advantage \
+  --selection-metric score_pairwise
+```
+
+Point `--state-rm-checkpoint-dir` at either the residual MLP or Transformer
+Episode-Q directory; the DDPO scorer detects the model contract automatically.
+
+The collector can also propose a larger candidate pool and use a trained
+Episode-Q ensemble to retain score anchors, uncertain candidates, and diverse
+state chunks before closed-loop labeling:
+
+```bash
+python src/train_policy_aligned_state_chunk_rm.py \
+  --auctionnet-root /path/to/AuctionNet \
+  --state-checkpoint-dir outputs/state_h3_k5_episode_q_ddpo \
+  --idm-checkpoint-dir outputs/idm_h3 \
+  --output-dir outputs/episode_q_active \
+  --collect-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --collect-only \
+  --candidate-count 8 \
+  --candidate-pool-size 32 \
+  --active-rm-checkpoint-dir outputs/transformer_episode_q \
+  --policy-version 1.0
+```
+
+Keep validation and test datasets fixed; active collection should augment only
+the RM training periods.
+
+Use those counterfactual contexts for one conservative DDPO update:
+
+```bash
+python src/train_policy_aligned_state_ddpo.py \
+  --csv-path "$DATA_CSV" \
+  --state-checkpoint-dir outputs/state_h3_k5 \
+  --state-rm-checkpoint-dir outputs/episode_q \
+  --rl-dataset-files outputs/episode_q/policy_aligned_state_chunk_period_*.npz \
+  --output-dir outputs/state_h3_k5_episode_q_ddpo \
+  --rl-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --ntp-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --ntp-validation-periods 25 \
+  --iterations 1 \
+  --group-size 8 \
+  --ppo-epochs 2 \
+  --learning-rate 1e-6 \
+  --score-source direct
+```
+
+On the locked Period 26-27 `N=1` test, this one-step update moves Continuous
+Score from `324.27` to `325.61`, with paired bootstrap 95% CI
+`[+0.42, +2.39]` and `p=0.0025`; continuous CPA violation is unchanged. See
+[`docs/POLICY_CONSISTENT_DDPO_RESULTS.md`](docs/POLICY_CONSISTENT_DDPO_RESULTS.md).
+
+For another alternating round, recollect with the updated policy and assign it
+a new scalar policy version. Mix current-policy and Base groups only in the RM
+training periods; validation and test should remain current-policy only:
+
+```bash
+python src/build_policy_snapshot_mixture.py \
+  --base-files outputs/episode_q_base/policy_aligned_state_chunk_period_*.npz \
+  --recent-files outputs/episode_q_round1/policy_aligned_state_chunk_period_*.npz \
+  --output-dir outputs/episode_q_round2_mixture \
+  --mix-periods 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
+  --recent-fraction 0.7
+```
+
+Train the refreshed RM with `--include-policy-version --policy-version 1.0`,
+then pass the same `--policy-version 1.0` to DDPO. Across three new Period 26-27
+replay seeds, the alternating Round-2 policy improves Continuous Score over
+Base by `+2.12`, advertiser-cluster bootstrap 95% CI `[+0.73, +3.57]`,
+`p=0.0022`. See the results document for the CPA tradeoff.
+
+With the active relative Transformer RM, three on-policy DDPO rounds are
+screened only on Period 25 and iteration 2 is locked by the CPA safety rule.
+Across three fresh Period 26-27 seeds, it improves the MLP Round-2 policy from
+`324.07` to `324.69` Continuous Score (`+0.62`, 95% CI `[+0.08,+1.18]`,
+`p=0.0242`) with unchanged observed CPA violation. This comparison uses
+`N=1`; no Best-of-N is applied.
 
 ## Optional CBD Adapter
 
