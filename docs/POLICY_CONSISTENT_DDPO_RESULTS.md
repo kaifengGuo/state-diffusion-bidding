@@ -187,3 +187,43 @@ It trails MLP by `-0.16`, paired-bootstrap CI `[-0.54,+0.12]`, `p=0.3410`.
 Because it failed the predeclared Period-25 policy gate, it was not evaluated
 on Periods 26-27. Active data fixes much of the RM generalization gap, while
 the remaining bottleneck is the DDPO policy update.
+
+## Multi-Round Relative Episode-Q DDPO
+
+The follow-up keeps the relative-active Transformer ensemble fixed and runs
+three conservative on-policy DDPO rounds at `lr=1e-6`. Each round recollects
+candidate groups with the updated policy. Inference uses one diffusion sample
+(`N=1`) and no Best-of-N.
+
+Period 25 alone selects the iteration:
+
+| Policy | Continuous Score | CPA violation | Budget utilization |
+|---|---:|---:|---:|
+| MLP Round 2 | 309.39 | **31.25%** | 82.53% |
+| Relative Active, iteration 1 | 309.22 | **31.25%** | 82.53% |
+| **Relative Active, iteration 2** | **310.38** | **31.25%** | **82.98%** |
+| Relative Active, iteration 3 | 311.06 | 33.33% | 83.51% |
+
+Iteration 2 is locked by the safety rule. Iteration 3 is rejected despite its
+higher Score because CPA violation rises by 2.08 percentage points. Periods
+26-27 are never used for iteration selection.
+
+Three fresh replay seeds give 288 Period 26-27 seed/advertiser episodes:
+
+| Policy | Continuous Score | Mean continuous reward | Aggregate CPA | CPA violation | Budget utilization |
+|---|---:|---:|---:|---:|---:|
+| MLP Round 2 | 324.07 | 347.41 | **6.873** | **23.96%** | 87.53% |
+| **Relative Active multi-round, iteration 2** | **324.69** | **348.35** | 6.890 | **23.96%** | **87.82%** |
+
+Advertiser-cluster bootstrap averages the three replay seeds within each
+Period/advertiser pair before resampling the 96 clusters. Relative Active
+iteration 2 minus MLP Round 2 improves Continuous Score by `+0.62`, 95% CI
+`[+0.08,+1.18]`, `p=0.0242`, and continuous Reward by `+0.94` per episode, CI
+`[+0.39,+1.52]`. Budget utilization increases by `0.294` percentage points.
+The observed CPA violation rate is unchanged, with difference CI
+`[-1.04,+1.04]` percentage points, while aggregate CPA rises by `0.016`, CI
+`[+0.011,+0.022]`.
+
+Multi-round policy refresh therefore closes the one-round optimization gap and
+produces a statistically supported gain over MLP Round 2. The higher aggregate
+CPA remains a measurable tradeoff and should be reported with the gain.

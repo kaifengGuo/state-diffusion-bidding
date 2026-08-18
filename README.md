@@ -36,6 +36,9 @@ This repository intentionally contains only model, training, evaluation, and tes
 - **Transformer Episode-Q ablation:** tokenizes historical and candidate future
   states, conditions on policy version and auction context, and can replace the
   residual MLP scorer in policy-aligned DDPO.
+- **Relative Episode-Q with active candidates:** learns within-context
+  advantage from score anchors, ensemble-disagreement cases, and diverse state
+  chunks, then supports repeated on-policy DDPO refreshes.
 
 DDPO and Best-of-N are independent. DDPO changes the policy parameters during
 post-training; Best-of-N ranks samples at inference. The released DDPO experiment
@@ -337,6 +340,13 @@ then pass the same `--policy-version 1.0` to DDPO. Across three new Period 26-27
 replay seeds, the alternating Round-2 policy improves Continuous Score over
 Base by `+2.12`, advertiser-cluster bootstrap 95% CI `[+0.73, +3.57]`,
 `p=0.0022`. See the results document for the CPA tradeoff.
+
+With the active relative Transformer RM, three on-policy DDPO rounds are
+screened only on Period 25 and iteration 2 is locked by the CPA safety rule.
+Across three fresh Period 26-27 seeds, it improves the MLP Round-2 policy from
+`324.07` to `324.69` Continuous Score (`+0.62`, 95% CI `[+0.08,+1.18]`,
+`p=0.0242`) with unchanged observed CPA violation. This comparison uses
+`N=1`; no Best-of-N is applied.
 
 ## Optional CBD Adapter
 
